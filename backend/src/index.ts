@@ -1,135 +1,122 @@
+
 import express from 'express';
 import http from 'http';
-import WebSocket from 'ws';
+import { Server } from 'socket.io';
+import type { WebRtcTransport } from '../types/mediasoup';
+import { MediasoupService } from './services/mediasoupServices';
 import * as mediasoup from 'mediasoup';
 
 const app = express();
 const server = http.createServer(app);
-const ws = new WebSocket.Server({ noServer: true }); // We'll attach it after mediasoup setup
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
 
-let worker: mediasoup.types.Worker;
-let router: mediasoup.types.Router;
+const port = 3000;
+const mediasoupService = new MediasoupService();
 
-async function createMediasoupWorker() {
-  worker = await mediasoup.createWorker();
-  router = await worker.createRouter({
-    mediaCodecs: [
-      {
-        kind: 'audio',
-        mimeType: 'audio/opus',
-        clockRate: 48000,
-        channels: 2,
-      },
-      {
-        kind: 'video',
-        mimeType: 'video/VP8',
-        clockRate: 90000,
-        parameters: {},
-      },
-    ],
-  });
-  console.log('Mediasoup Worker and Router started');
-}
 
-async function startServer() {
-  await createMediasoupWorker();
 
-  const ws = new WebSocket.Server({ server });
+(async () => {
+  await mediasoupService.initialize();
 
-  ws.on('connection', (ws) => {
-    console.log('WebSocket client connected');
+  io.on('connection', (socket) => {
+    console.log(`Client connected: ${socket.id}`);
 
-    let transport: mediasoup.types.WebRtcTransport | null = null;
-    let producer: mediasoup.types.Producer | null = null;
-
-    ws.on('message', async (message) => {
-      console.log('Received message:', message.toString());
-
+    // 1. Send router RTP capabilities
+    socket.on('getRtpCapabilities', (callback: (response: any) => void) => {
       try {
-        const msg = JSON.parse(message.toString());
-        const { action, data } = msg;
-
-        if (action === 'createWebRtcTransport') {
-          transport = await router.createWebRtcTransport({
-            listenIps: [{ ip: '0.0.0.0', announcedIp: undefined }],
-            enableUdp: true,
-            enableTcp: true,
-            preferUdp: true,
-            initialAvailableOutgoingBitrate: 1000000,
-          });
-
-          ws.send(
-            JSON.stringify({
-              action: 'webRtcTransportCreated',
-              data: {
-                id: transport.id,
-                iceParameters: transport.iceParameters,
-                iceCandidates: transport.iceCandidates,
-                dtlsParameters: transport.dtlsParameters,
-              },
-            }),
-          );
-        } else if (action === 'connectTransport') {
-          if (!transport) throw new Error('Transport not created');
-          await transport.connect({ dtlsParameters: data.dtlsParameters });
-          ws.send(JSON.stringify({ action: 'transportConnected' }));
-        } else if (action === 'produce') {
-          if (!transport) throw new Error('Transport not created');
-          producer = await transport.produce({
-            kind: data.kind,
-            rtpParameters: data.rtpParameters,
-          });
-
-          ws.send(JSON.stringify({ action: 'produced', data: { id: producer.id } }));
-        } else if (action === 'getRtpCapabilities') {
-          const routerRtpCapabilities = router.rtpCapabilities;
-          ws.send(JSON.stringify({ action: 'rtpCapabilities', data: routerRtpCapabilities }));
-        } else if (action === 'consume') {
-          if (!transport) throw new Error('Transport not created');
-          if (!producer) throw new Error('Producer not available');
-
-          const consumer = await transport.consume({
-            producerId: producer.id,
-            rtpCapabilities: data.rtpCapabilities,
-            paused: false,
-          });
-
-          ws.send(
-            JSON.stringify({
-              action: 'consumed',
-              data: {
-                id: consumer.id,
-                producerId: producer.id,
-                kind: consumer.kind,
-                rtpParameters: consumer.rtpParameters,
-              },
-            }),
-          );
-        }
-      } catch (err: unknown) {
-        console.error('Error handling WS message:', err);
-        if (err instanceof Error) {
-          ws.send(JSON.stringify({ action: 'error', data: err.message }));
-        } else {
-          ws.send(JSON.stringify({ action: 'error', data: String(err) }));
-        }
+        const rtpCapabilities = mediasoupService.getRouterCapabilities();
+        callback({ rtpCapabilities });
+      } catch (err: any) {
+        console.error(err);
+        callback({ error: err?.message || 'Unknown error' });
       }
     });
 
-    ws.on('close', () => {
-      console.log('Client disconnected');
-      if (producer) producer.close();
-      if (transport) transport.close();
+    // 2. Create WebRTC transport for sending/receiving media
+    socket.on('createTransport', async (callback: (response: any) => void) => {
+      try {
+        const transport = await mediasoupService.createWebRtcTransport();
+
+        transport.on('dtlsstatechange', (state: mediasoup.types.DtlsState) => {
+          if (state === 'closed') transport.close();
+        });
+
+        transport.on('close' as any, () => {
+          console.log('Transport closed');
+        });
+
+        // Initialize socket data if not exists
+        if (!socket.data) {
+          socket.data = {};
+        }
+        socket.data.transport = transport;
+
+        callback({
+          id: transport.id,
+          iceParameters: transport.iceParameters,
+          iceCandidates: transport.iceCandidates,
+          dtlsParameters: transport.dtlsParameters,
+        });
+      } catch (err: any) {
+        console.error(err);
+        callback({ error: err?.message || 'Unknown error' });
+      }
     });
 
-    ws.on('error', (err) => {
-      console.error('WebSocket error:', err);
+    // 3. Connect WebRTC transport with DTLS parameters
+    socket.on('connectTransport', async ({ dtlsParameters }: { dtlsParameters: mediasoup.types.DtlsParameters }, callback: (response: any) => void) => {
+      try {
+        const transport = socket.data?.transport;
+        if (!transport) {
+          throw new Error('Transport not found');
+        }
+        await transport.connect({ dtlsParameters });
+        callback({ connected: true });
+      } catch (err: any) {
+        console.error(err);
+        callback({ error: err?.message || 'Unknown error' });
+      }
+    });
+
+    // 4. Produce media (audio/video)
+    socket.on('produce', async ({ kind, rtpParameters }: { kind: mediasoup.types.MediaKind, rtpParameters: mediasoup.types.RtpParameters }, callback: (response: any) => void) => {
+      try {
+        const transport = socket.data?.transport;
+        if (!transport) {
+          throw new Error('Transport not found');
+        }
+        
+        const producer = await transport.produce({ kind, rtpParameters });
+
+        mediasoupService.addProducer(producer);
+
+        producer.on('transportclose', () => {
+          mediasoupService.removeProducer(producer.id);
+        });
+
+        callback({ id: producer.id });
+      } catch (err: any) {
+        console.error(err);
+        callback({ error: err?.message || 'Unknown error' });
+      }
+    });
+
+    // 5. Close transport and cleanup
+    socket.on('disconnect', async () => {
+      console.log(`Client disconnected: ${socket.id}`);
+      const transport = socket.data?.transport;
+      if (transport) {
+        transport.close();
+      }
     });
   });
 
-  server.listen(3000, () => {
-    console.log('Server running on http://localhost:3000');
+  server.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
   });
-}
-
-startServer().catch(console.error);
+})();
